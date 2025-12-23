@@ -1,0 +1,404 @@
+---
+title: "5: Spatial upscaling"
+author: "Fabrice Mettler"
+date: "2025-12-22"
+output:
+  html_document:
+    output_file: Block_5.html
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(skimr)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ranger)
+library(recipes)
+library(dplyr)
+library(purrr)
+library(lattice)
+```
+
+
+```{r, include=FALSE}
+df <- readr::read_csv("https://raw.githubusercontent.com/geco-bern/leafnp_data/main/data/leafnp_tian_et_al.csv")
+
+common_species <- df |>
+  dplyr::group_by(Species) |>
+  dplyr::summarise(count = n()) |>
+  dplyr::arrange(desc(count)) |>
+  dplyr::slice(1:50) |>
+  dplyr::pull(Species)
+
+dfs <- df |>
+  dplyr::select(leafN, lon, lat, elv, mat, map, ndep, mai, Species) |>
+  dplyr::filter(Species %in% common_species)
+# group_by(lon, lat) |>
+# summarise(across(where(is.numeric), mean))
+
+# quick overview of data
+skimr::skim(dfs)
+```
+
+# Literature
+Answers to the questions after reading the paper by Ludwig et al. (2023)
+
+#### Difference between a random cross-validation and a spatial cross-validation:
+In a cross-validation (CV), the dataset is split up in a training and a test (or validation) set. This split can be made randomly (random CV) or based on their spatial information (spatial CV) which, depending on the method, has a critical impact on the model accuracy. The difference gets especially important in the presence of spatially clustered training data. A model trained on random CV holds the ability to make predictions only within the clusters and is usually not suitable for extrapolation. In contrast, for spatial CV, whole clusters are left out and used for validation. This trains the model to be able to better predict data points at new spatial locations. In other words, spatial CV copes better with spatial autocorrelation (which is usually the case in environmental data) as it explicitly separates them.
+
+#### Alternative to geographical distance in Euclidian space:
+The geographical distance in Euclidean space works usually well in earth science, as geographically close points usually have similar environmental conditions. However, this is not always the case, especially if we have strong environmental gradients. Additionally, similar environmental conditions occur at places which are geographically far away. One example might be high mountain regions, which are generally more similar to each other than to nearby lowlands. Or one might think of the Mediterranean climate, which occurs around the Mediterranean Sea but also in south-western Australia, California and the Western Cape of South Africa. In this case, it may be more appropriate to use the "environmental closeness" i.e. the environmental feature space. This is a multidimensional space, where datapoints with similar environmental conditions are  closer together, independent of geographical location.
+
+# Random cross-validation
+```{r}
+# Ensure species is a factor
+dfs$Species <- as.factor(dfs$Species)
+
+# Specify target:
+target <- "leafN"
+
+# Specify predictors:
+predictors <- names(dfs)[4:9]
+
+cat(
+  "The target is:", target,
+  "\nThe predictors are:", paste0(predictors, sep = ", ")
+)
+```
+
+```{r}
+# set seed
+set.seed(101)
+
+# recipe
+pp <- recipes::recipe(
+  leafN ~ elv + mat + map + ndep + mai + Species,
+  data = dfs) |>
+  recipes::step_center(recipes::all_numeric_predictors()) |>
+  recipes::step_scale(recipes::all_numeric_predictors())
+
+ctrl <- caret::trainControl(
+  method = "cv",
+  number = 5
+)
+
+model_random_cv <- caret::train(
+  pp,
+  data = dfs |> tidyr::drop_na(),
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = expand.grid(
+    .mtry = 3,
+    .min.node.size = 12,
+    .splitrule = "variance"
+  ),
+  metric = "RMSE",
+  seed = 101
+)
+
+out_random <- model_random_cv$resample
+knitr::kable(model_random_cv$resample)
+cat(
+  "Mean RMSE:", mean(model_random_cv$resample$RMSE),
+  "Mean R^2:", mean(model_random_cv$resample$Rsquared)
+)
+
+```
+The RMSE and $R^2$ are similar across the folds.
+
+# Spatial cross-validation
+#### distribution
+First, lets look at the distribution of our data across the globe:
+```{r}
+# get coast outline
+coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
+
+ggplot2::ggplot() +
+
+  # plot coastline
+  ggplot2::geom_sf(
+    data = coast,
+    colour = "black",
+    size = 0.2
+  ) +
+
+  # set extent in longitude and latitude
+  ggplot2::coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE
+  ) + # to draw map strictly bounded by the specified extent
+
+  # plot points on map
+  ggplot2::geom_point(data = dfs, ggplot2::aes(x = lon, y = lat), color = "red", size = 0.2) +
+  labs(x = "", y = "") +
+  ggplot2::theme_bw() +
+  ggplot2::theme(legend.position = "bottom")
+```
+Most data points are located in Europe and eastern Asia, whereas only a sparse amount of datapoints are located at the rest of the world. This implicates that a model trained with random CV is trained and evaluated mostly on points in Europe and China which probably results an a rather good mean accuracy, as most of the validation points will be located there as well (area of applicability), although the model might not be accurate at predicting in the rest of the world. Since the region in Easter Asia is climatologically very diverse, the environmental CV might perform good, as most of the environmental conditions around the world are represented by some places in Eastern Asia. 
+
+#### Identification of geographical clusters 
+Now, let's look at the geographical cluster
+```{r}
+# cluster the data into 5 classes
+set.seed(101)
+clusters <- stats::kmeans(
+  dfs[, c("lon", "lat")],
+  centers = 5
+)
+
+dfs$cluster <- factor(clusters$cluster)
+```
+
+```{r, echo=FALSE}
+# get coast outline
+coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
+
+ggplot2::ggplot() +
+  
+  ggplot2::geom_sf(
+    data = coast,
+    colour = "black",
+    size = 0.2
+  ) +
+  
+  ggplot2::coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE
+  ) +
+  
+  ggplot2::geom_point(
+    data = dfs,
+    ggplot2::aes(x = lon, y = lat, colour = cluster),
+    size = 0.3
+  )
+```
+The five clusters are indicated with different colors. We see how points belonging to the same cluster are geographically close together. Interestingly, cluster 1 includes western Europe and the American Continent. The function kmeans() might be limited by the way of how longitude is indicated (reaching from -180 to 180). The function kmeans() probably does not realize that the earth is round and treats points at -179 and 179 as far away.
+
+#### Distribution of leaf N by cluster
+```{r}
+ggplot2::ggplot(dfs, ggplot2::aes(x = cluster, y = leafN)) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0.3) +
+  ggplot2::labs(
+    x = "Spatial cluster",
+    y = "Leaf N"
+  )
+```
+Leaf nitrogen seems to be more or less evenly distributed over the clusters. Notably, all the cluster have a lot of outliers.
+
+#### Random forest
+
+```{r}
+#df_spat <- dfs
+#df_spat$cluster <- sample(1:5, nrow(df_spat), replace = TRUE)
+
+group_folds_train <- purrr::map(
+  seq(length(unique(dfs$cluster))),
+  ~ {
+    dfs |>
+      select(cluster) |>
+      mutate(idx = 1:n()) |>
+      filter(cluster != .) |>
+      pull(idx)
+  }
+)
+
+group_folds_test <- purrr::map(
+  seq(length(unique(dfs$cluster))),
+  ~ {
+    dfs |>
+      select(cluster) |>
+      mutate(idx = 1:n()) |>
+      filter(cluster == .) |>
+      pull(idx)
+  }
+)
+
+# create a function that trains a random forest model on a given set of rows and 
+# predicts on a disjunct set of rows
+train_test_by_fold <- function(idx_train, idx_val){
+      data_pred <- dfs |> dplyr::slice(idx_train)
+      data_eval <- dfs |> dplyr::slice(idx_val)
+
+  mod <- ranger::ranger(
+
+    x =  data_pred |> select(elv, mat, map, ndep, mai, Species),  # data frame with columns corresponding to predictors
+    y =   data_pred |>  select(leafN) |> unlist(),# a vector of the target values (not a data frame!)
+    mtry = 3,
+    min.node.size = 12,
+    splitrule = "variance"
+  )
+  
+  data_eval$pred <- predict(mod,       # the fitted model object 
+                  data =  data_eval |>dplyr::select(elv, mat, map, ndep, mai, Species)# a data frame with columns corresponding to predictors
+                  )$predictions
+
+  metrics_test <- data_eval |>
+  yardstick::metrics(leafN, pred)
+  
+  rsq <- metrics_test |>
+  filter(.metric == "rsq") |>
+  pull(.estimate)  # the R-squared determined on the validation set
+  
+  rmse <- metrics_test |>
+  filter(.metric == "rmse") |>
+  pull(.estimate)# the root mean square error on the validation set
+
+  return(tibble(rsq = rsq, rmse = rmse))
+}
+
+# apply function on each custom fold and collect validation results in a nice
+# data frame
+out_spatial <- purrr::map2_dfr(
+  group_folds_train,
+  group_folds_test,
+  ~train_test_by_fold(.x, .y)
+) |> 
+  mutate(test_fold = 1:5)
+tab_spatial <- knitr::kable(out_spatial)
+tab_spatial
+
+cat(
+  "Mean RMSE:", mean(out_spatial$rmse),
+  "Mean R^2:", mean(out_spatial$rsq)
+)
+```
+
+Results are discussed later.
+
+# Environmental cross-validation
+```{r}
+# cluster the data into 5 classes
+#set.seed(101)
+#clusters_env <- kmeans(
+#  dfs[, c("mat", "map")],
+#  centers = 5  
+#)
+
+#dfs$cluster_env <- factor(clusters_env$cluster)
+
+env_vars <- dfs |> 
+  select(mat, map) |> 
+  scale()
+
+set.seed(101)
+clusters_env <- kmeans(env_vars, centers = 5)
+dfs$cluster_env <- factor(clusters_env$cluster)
+```
+
+```{r, echo=FALSE}
+# get coast outline
+coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
+
+ggplot2::ggplot() +
+  
+  ggplot2::geom_sf(
+    data = coast,
+    colour = "black",
+    size = 0.2
+  ) +
+  
+  ggplot2::coord_sf(
+    ylim = c(-60, 80),
+    expand = FALSE
+  ) +
+  
+  ggplot2::geom_point(
+    data = dfs,
+    ggplot2::aes(x = lon, y = lat, colour = cluster_env),
+    size = 0.3
+  )
+```
+The environmental clusters are presented in the maps above. When combining the information below, we can interpret them. For example, Cluster 4 has high mean annual temperatures and high precipitation. This matches the map as we see cluster 4 (blue), is located in the tropical region in South America and the tropical south of China. 
+
+```{r}
+ggplot2::ggplot(dfs, aes(x = cluster_env, y = leafN)) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0.3) +
+  ggplot2::labs(
+    x = "Environmental cluster",
+    y = "Leaf N"
+  )
+```
+Leaf N again shows a more or less equal distribution among clusters.
+```{r}
+ggplot2::ggplot(dfs, aes(x = cluster_env, y = mat)) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0.3) +
+  ggplot2::labs(
+    x = "Environmental cluster",
+    y = "mean annual temperature"
+  )
+```
+We see how mean annual temperatures does now differ between the clusters (compared to before scaling).
+```{r}
+ggplot2::ggplot(dfs, aes(x = cluster_env, y = map)) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0.3) +
+  ggplot2::labs(
+    x = "Environmental cluster",
+    y = "mean annual precipitation"
+  )
+```
+Precipitation, on the other hand, differs less than before scaling, but still shows some distinct patterns.
+```{r}
+group_folds_train <- purrr::map(
+  seq(length(unique(dfs$cluster_env))),
+  ~ {
+    dfs |>
+      select(cluster_env) |>
+      mutate(idx = 1:n()) |>
+      filter(cluster_env != .) |>
+      pull(idx)
+  }
+)
+
+group_folds_test <- purrr::map(
+  seq(length(unique(dfs$cluster_env))),
+  ~ {
+    dfs |>
+      select(cluster_env) |>
+      mutate(idx = 1:n()) |>
+      filter(cluster_env == .) |>
+      pull(idx)
+  }
+)
+
+
+# apply function on each custom fold and collect validation results in a nice
+# data frame
+out_env <- purrr::map2_dfr(
+  group_folds_train,
+  group_folds_test,
+  ~train_test_by_fold(.x, .y)
+) |> 
+  mutate(test_fold = 1:5)
+tab_env <- knitr::kable(out_env)
+tab_env
+
+cat(
+  "Mean RMSE:", mean(out_env$rmse),
+  "Mean R^2:", mean(out_env$rsq)
+)
+```
+
+#### Comparison
+```{r}
+par(mfrow = c(3, 1))
+print(out_random)
+print(out_spatial)
+print(out_env)
+
+cat(
+  "Random CV\n",
+  "Mean RMSE:", mean(model_random_cv$resample$RMSE), "\n",
+  "Mean R^2:", mean(model_random_cv$resample$Rsquared), "\n\n",
+  
+  "Spatial CV\n",
+  "Mean RMSE:", mean(out_spatial$rmse), "\n",
+  "Mean R^2:", mean(out_spatial$rsq), "\n\n",
+  
+  "Environmental CV\n",
+  "Mean RMSE:", mean(out_env$rmse), "\n",
+  "Mean R^2:", mean(out_env$rsq), "\n"
+)
+```
+When comparing the three CV methods, we see a difference in the resulting RMSE and $R^2$. For random CV, RMSE and $R^2$ are similar across folds. This is expected, as the model is trained in the same geographical and feature space as tested. Bu as mentioned in Ludwig et al. (2023), the area of applicability for this model is limited to the space where training data is located. Differences between folds are more pronounced in the spatial CV and environmental CV. This represents the fact, that there are differences between the geographical space and the feature space. Depending on which places are left out for training, the model struggles more or less to generalize. The spatial CV model has lower mean $R^2$ and higher RMSE compared to the random CV model. This is again expected, as this model was trained for being better at generalization as it was validated on spatially new data. We also see that especially fold nr. 3 seems to be bad at predicting. When looking on the map, we see that cluster 3 is located mostly in china, where we have large differences in environmental conditions in a relatively small geographical area. The environmental CV shows somehow similar results in RMSE and $R^2$ as the spatial CV. This is expected too, as environmental factors are also spatially dependent. The environmental CV outperforms the spatial CV, indicating its potential for such applications.
